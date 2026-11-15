@@ -23,6 +23,12 @@ Sur la carte microSD :
 | `bbNNNN_events.csv` | chaque anomalie avec **début, fin, durée** et valeur la plus défavorable, plus les **marqueurs** posés au bouton |
 | `bbNNNN_cap_KKK.csv` | **capture 2 kHz** des voies rapides, de 1 s avant à 0,5 s après l'événement qui l'a déclenchée |
 
+Et **dans la flash interne de la carte**, même sans carte SD (voir § 8) :
+
+| Mémoire | Contenu |
+|---|---|
+| anneau flash ~2,4 Mo | les mêmes voies à **50 lignes/s**, en boucle sur les **~13 dernières minutes**. Au premier événement déclencheur, l'enregistrement continue encore 10 s puis **se fige**. Le contenu est conservé même après une coupure de courant, jusqu'au réarmement |
+
 `NNNN` est le numéro de démarrage du boîtier ; il s'incrémente à chaque mise sous tension. Le temps `t_ms` est compté depuis la mise sous tension.
 
 ## 2. Points de mesure au calculateur
@@ -120,7 +126,7 @@ Côté câble : utiliser un **multiconducteur blindé** (blindage relié à la m
 
 PlatformIO : ouvrir le dossier puis lancer *Upload*. L'écran et les bibliothèques sont configurés dans `platformio.ini`, sur la plateforme `espressif32@6.9.0` (Arduino ESP32 2.0.17).
 
-Avec l'Arduino IDE : installer le core ESP32 **2.0.17**, ainsi que les bibliothèques TFT_eSPI (activer `Setup25_TTGO_T_Display.h`) et Adafruit ADS1X15. Copier `src/` dans un dossier `blackbox/` et renommer `main.cpp` en `blackbox.ino`. Choisir le schéma de partition **« Huge APP (3MB No OTA) »**, car le Wi-Fi alourdit le programme.
+Avec l'Arduino IDE : installer le core ESP32 **2.0.17**, ainsi que les bibliothèques TFT_eSPI (activer `Setup25_TTGO_T_Display.h`) et Adafruit ADS1X15. Copier `src/` dans un dossier `blackbox/` et renommer `main.cpp` en `blackbox.ino`. Le fichier **`partitions.csv`** doit être copié dans le même dossier : le core ESP32 l'utilise automatiquement. Il réserve 1,5 Mo au programme et 2,4 Mo à la mémoire en boucle.
 
 Tous les réglages se trouvent dans **`src/config.h`** : brochage, rapports des ponts, seuils, cadence.
 
@@ -135,6 +141,7 @@ Tous les réglages se trouvent dans **`src/config.h`** : brochage, rapports des 
 | Bouton | Action |
 |---|---|
 | Gauche (GPIO0) | écran suivant : BLACKBOX → PÉDALE → PAPILLON → ALIM → ÉVÉNEMENTS |
+| Gauche maintenu 2 s | **réarmer** la mémoire flash figée (efface l'enregistrement figé) |
 | Droit (GPIO35) / bouton déporté | **MARQUEUR** : à presser dès que la panne est ressentie |
 | Droit maintenu 2 s | pause / reprise. **Mettre en pause avant de retirer la carte SD** |
 
@@ -153,7 +160,19 @@ Le journal est écrit sur la carte au moins une fois par seconde. Une coupure br
 
 Chaque début d'événement lance une capture rapide, sauf si une capture est déjà en cours d'écriture.
 
-## 8. Interface web (temps réel sur téléphone)
+## 8. Mémoire flash en boucle
+
+C'est l'outil prévu pour vérifier si le rejet de la pédale vient bien d'un **décalage entre les pistes**.
+
+1. Le boîtier enregistre en permanence dans sa flash les 12 voies précises et le min/max des voies rapides, à 50 lignes/s. Il garde ainsi en boucle les ~13 dernières minutes.
+2. Au premier événement déclencheur, il note l'instant et le type, continue pendant **10 s**, puis **fige** la mémoire. Par défaut, les déclencheurs sont : `PEDALE_INCOH` (écart S1 − 2·S2), `HORS_PLAGE` et le **marqueur**. Ils se règlent avec `ROLL_TRIG_MASK` et `ROLL_POST_S` dans `config.h`.
+3. Le contenu figé survit à l'arrêt du moteur et à la coupure du boîtier. L'écran d'accueil affiche alors « FLASH FIGEE » avec la cause.
+4. On le récupère sur la page web (**Télécharger la mémoire flash**, fichier `roll_runN.csv`). Les colonnes sont les mêmes que le journal SD, donc `tools/analyse.py journal roll_run3.csv` fonctionne directement. L'en-tête indique l'instant du déclenchement.
+5. On **réarme** ensuite : bouton sur la page web ou appui de 2 s sur le bouton gauche.
+
+**Limite matérielle à connaître** : quand l'ESP32 écrit dans sa propre flash, ses deux cœurs sont suspendus. Cela arrive environ 45 ms toutes les 1,3 s. Pendant ce temps, la chaîne rapide ne mesure rien et les ADS1115 attendent. Les lignes concernées portent le **bit 15 (32768) dans `flags`**, dans le journal SD comme dans la mémoire flash. Un événement très bref peut tomber dans ce trou. En revanche, un rejet de pédale par le calculateur dure en général bien plus longtemps et sera capté.
+
+## 9. Interface web (temps réel sur téléphone)
 
 Le boîtier crée son propre réseau Wi-Fi, sans box ni Internet :
 
@@ -163,6 +182,7 @@ Le boîtier crée son propre réseau Wi-Fi, sans box ni Internet :
 | Onglet | Contenu |
 |---|---|
 | Temps réel | toutes les voies avec code couleur, rafraîchies 10 fois par seconde. Courbes sur 30 s de la pédale (S1 et 2×S2), du papillon et des deux 5 V. Les bandes claires montrent le **min/max à 2 kHz** entre deux rafraîchissements, donc une microcoupure reste visible |
+| Mémoire flash | état (enregistre / après déclenchement / figée), cause et instant du déclenchement, **téléchargement** et **réarmement** |
 | Événements | les 20 derniers, mis à jour dès qu'il en arrive un |
 | Fichiers | liste de la carte SD et **téléchargement direct** des journaux et captures, sans retirer la carte. L'enregistrement continue pendant le téléchargement. Le fichier en cours d'écriture demande une pause |
 
@@ -170,7 +190,7 @@ Les boutons **MARQUEUR** et **Pause** de la page font la même chose que les bou
 
 **Remarque** : le Wi-Fi ajoute un peu de bruit sur l'ADC de l'ESP32 et quelques dizaines de mA de consommation. Pour une session de mesure « propre », on peut le couper avec `WIFI_ENABLE 0` dans `config.h`.
 
-## 9. Analyse
+## 10. Analyse
 
 ```bash
 pip install pandas matplotlib
@@ -193,7 +213,7 @@ Le tracé du journal comporte six panneaux : pistes pédale avec bandes min/max,
 | Pointes brèves sur plusieurs voies en même temps, sans cause d'alimentation | **perturbation** (parasite). Noter dans quelle situation de conduite elles apparaissent |
 | Tous les signaux parfaits au calculateur, mais le défaut est quand même enregistré | **calculateur** (étage d'entrée) fortement suspect |
 
-## 10. Évolutions possibles
+## 11. Évolutions possibles
 
 - Mesure du pilotage moteur du papillon (G1/G2) par opto-coupleurs, pour voir l'instant où le calculateur coupe la commande.
 - Régime moteur, via le signal du capteur 1313 ou le CAN, pour corréler les pointes avec l'allumage.

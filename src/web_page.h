@@ -45,7 +45,9 @@ a{color:#0bc}
   <canvas id="ct"></canvas>
   <h2>Alimentations 5 V capteurs</h2><canvas id="c5"></canvas>
   <h2>Calculateur</h2><div class="grid" id="ge"></div>
-  <h2>Enregistrement</h2><div class="grid" id="gr"></div>
+  <h2>Mémoire flash en boucle</h2><div class="grid" id="gf"></div>
+  <p><a href="/roll.csv"><button>Télécharger la mémoire flash (CSV)</button></a> <button id="rearm">Réarmer</button></p>
+  <h2>Carte SD</h2><div class="grid" id="gr"></div>
   <p class="note">Courbes : 30 dernières secondes. Les bandes claires sont le min/max mesuré à 2 kHz entre deux rafraîchissements : une microcoupure y apparaît même si elle est brève.</p>
 </section>
 <section id="ev" class="hide">
@@ -53,6 +55,7 @@ a{color:#0bc}
 </section>
 <section id="files" class="hide">
   <p class="note">Mettre l'enregistrement en <b>pause</b> pour télécharger le fichier en cours. Les autres se téléchargent à tout moment.</p>
+  <p><a href="/roll.csv">Mémoire flash en boucle (roll.csv)</a> — disponible même sans carte SD.</p>
   <button id="fr">Actualiser</button>
   <table><thead><tr><th>fichier</th><th>taille</th></tr></thead><tbody id="fb"></tbody></table>
 </section>
@@ -65,6 +68,7 @@ function card(g,id,l){g.insertAdjacentHTML('beforeend',`<div class="card"><div c
 [['gp',[['vV5P','+5 V (G1 · 1380)'],['vS1','S1 (F2 · 1377)'],['vS2','S2 (G2 · 1378)'],['vGNDP','masse capteur (F1)'],['vEP','écart S1 − 2·S2']]],
  ['gt',[['vV5T','+5 V (A1 · 1219)'],['vT1','piste 1 (B1 · 1218)'],['vT2','piste 2 (B4 · 1367)'],['vGNDT','masse capteur (A4)'],['vTS','T1 + T2']]],
  ['ge',[['vV12BAT','+BAT (M3 · 140F)'],['vV12REL','+ après relais'],['vGNDECU','masse calculateur'],['vV12C','12 V vu par le calc.']]],
+ ['gf',[['vRST','état'],['vRSEC','contenu'],['vRTRIG','déclenchement'],['vRT','à t =']]],
  ['gr',[['vFILE','fichier'],['vEV','événements'],['vCAP','captures'],['vMB','écrit'],['vDROP','pertes lignes / évts'],['vHZ','cadence ADS / rapide']]]
 ].forEach(([g,a])=>a.forEach(([i,l])=>card($(g),i,l)));
 function set(id,t,c){const e=$(id);e.textContent=t;e.style.color=c||''}
@@ -108,6 +112,11 @@ function update(d){
   set('vV12C',f3(a.V12REL-a.GNDECU),c12(a.V12REL-a.GNDECU));
   set('vFILE',d.file);set('vEV',d.ev);set('vCAP',d.caps);set('vMB',d.mb.toFixed(1)+' Mo');
   set('vDROP',d.drop+' / '+d.evlost,(d.drop||d.evlost)?COL.bad:'');set('vHZ',d.adsHz+' / '+d.fastHz+' Hz');
+  const r=d.roll, rc={'FIGE':'#0bc','APRES-DECL':COL.warn,'ENREG':COL.ok}[r.st]||COL.bad;
+  set('vRST',{'FIGE':'FIGÉE','APRES-DECL':'après déclenchement','ENREG':'enregistre','ABSENT':'absente'}[r.st]||r.st,rc);
+  set('vRSEC',r.sec+' s / '+r.cap+' s');set('vRTRIG',r.trig.trim()==='- 0.000'?'-':r.trig);
+  set('vRT',r.st==='FIGE'||r.st==='APRES-DECL'?hms(r.trigT)+(r.boot&&r.st==='FIGE'?' (dém. '+r.boot+')':''):'-');
+  $('rearm').disabled=r.st!=='FIGE';
   if(d.ev!==lastEv&&tab==='ev')loadEv();lastEv=d.ev;
 }
 function draw(){
@@ -144,6 +153,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
 });
 $('fr').onclick=loadFiles;
 $('mark').onclick=async()=>{await fetch('/api/mark',{method:'POST'});$('mark').classList.add('flash');setTimeout(()=>$('mark').classList.remove('flash'),300)};
+$('rearm').onclick=()=>{if(confirm('Effacer la mémoire flash figée et relancer l\'enregistrement ?'))fetch('/api/roll/rearm',{method:'POST'})};
 $('pause').onclick=()=>fetch('/api/pause',{method:'POST'});
 addEventListener('resize',draw);
 poll();

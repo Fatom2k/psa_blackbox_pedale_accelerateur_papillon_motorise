@@ -27,6 +27,7 @@
 #include <driver/adc.h>
 #include <esp_adc_cal.h>
 #include <esp_timer.h>
+#include <esp_partition.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include "config.h"
@@ -339,7 +340,7 @@ static void loggerTask(void *) {
       aggSwapReq = false;                       // voie rapide figée : on le signale
       for (int i = 0; i < FAST_N; i++) { r.mn[i] = 0xFFFF; r.mx[i] = 0xFFFF; }
     }
-    if (logging && xQueueSend(rowQ, &r, 0) != pdTRUE) rowsDropped++;
+    if (xQueueSend(rowQ, &r, 0) != pdTRUE) rowsDropped++;
   }
 }
 
@@ -442,6 +443,201 @@ static void dumpCapture() {
   portEXIT_CRITICAL(&capMux);
 }
 
+
+// ============================================================================
+// Enregistrement en boucle dans la flash interne (partition « rolllog »)
+//   secteur 0 : en-tête (état, déclenchement) ; secteurs 1..N : anneau de RollRec
+// ============================================================================
+#define FLAG_FLASH (1u << 15)                    // bit des lignes pendant une écriture flash
+
+struct __attribute__((packed)) RollRec {
+  uint32_t seq;                                  // numéro d'ordre dans le cycle (0xFFFFFFFF = vide)
+  uint32_t t_ms;
+  uint16_t run;                                  // numéro de cycle (change à chaque réarmement)
+  uint16_t flags;
+  int16_t  ads[ADS_N];                           // mV
+  uint16_t mn[FAST_N], mx[FAST_N];               // mV, 0xFFFF = indisponible
+  uint8_t  pad[4];
+};
+static_assert(sizeof(RollRec) == 64, "RollRec doit faire 64 octets");
+#define ROLL_PER_SECT (4096 / sizeof(RollRec))
+
+enum RollState : uint8_t { RS_OFF, RS_RUN, RS_POST, RS_FROZEN };
+static const char *const RS_NAME[4] = { "ABSENT", "ENREG", "APRES-DECL", "FIGE" };
+
+struct RollHdr {
+  uint32_t magic;                                // 'ROL1'
+  uint16_t recSize, run;
+  uint32_t boot;
+  uint8_t  state, trigType, trigCh, rollHz;
+  float    trigValue;
+  uint32_t trigSeq, trigMs, lastSeq;
+};
+#define ROLL_MAGIC 0x314C4F52u
+
+static const esp_partition_t *rollPart = nullptr;
+static uint32_t rollSectors = 0, rollCap = 0;
+static volatile uint8_t rollState = RS_OFF;
+static RollHdr rollHdr;
+static RollRec rollBuf[ROLL_PER_SECT];
+static uint32_t rollBufN = 0;
+static volatile uint32_t rollSeq = 0;           // prochain numéro à écrire
+static uint32_t rollPostEnd = 0;
+static SemaphoreHandle_t flashMtx;
+static volatile bool rollRearmReq = false;
+
+static void rollWriteHdr() {                    // appelé sous flashMtx
+  __atomic_fetch_or(&evFlags, FLAG_FLASH, __ATOMIC_RELAXED);
+  esp_partition_erase_range(rollPart, 0, 4096);
+  esp_partition_write(rollPart, 0, &rollHdr, sizeof rollHdr);
+}
+
+static void rollFlushSector() {                 // appelé sous flashMtx
+  if (!rollBufN) return;
+  const uint32_t sect = (rollBuf[0].seq / ROLL_PER_SECT) % rollSectors;
+  const size_t off = (1 + sect) * 4096;
+  __atomic_fetch_or(&evFlags, FLAG_FLASH, __ATOMIC_RELAXED);
+  esp_partition_erase_range(rollPart, off, 4096);
+  esp_partition_write(rollPart, off, rollBuf, rollBufN * sizeof(RollRec));
+  rollBufN = 0;
+}
+
+static void rollStart() {
+  const uint16_t run = (rollHdr.magic == ROLL_MAGIC) ? rollHdr.run + 1 : 1;
+  memset(&rollHdr, 0, sizeof rollHdr);
+  rollHdr.magic = ROLL_MAGIC; rollHdr.recSize = sizeof(RollRec); rollHdr.run = run;
+  rollHdr.boot = bootNo; rollHdr.state = RS_RUN; rollHdr.rollHz = ROLL_HZ;
+  rollSeq = 0; rollBufN = 0;
+  xSemaphoreTake(flashMtx, portMAX_DELAY);
+  rollWriteHdr();
+  xSemaphoreGive(flashMtx);
+  rollState = RS_RUN;
+}
+
+// Dernier enregistrement valide du cycle en cours (après une coupure en phase « après déclenchement »)
+static uint32_t rollScanLast() {
+  RollRec r;
+  int64_t best = -1;
+  uint32_t bestSect = 0;
+  for (uint32_t s = 0; s < rollSectors; s++) {
+    esp_partition_read(rollPart, (1 + s) * 4096, &r, sizeof r);
+    if (r.seq != 0xFFFFFFFFu && r.run == rollHdr.run && (int64_t)r.seq > best) { best = r.seq; bestSect = s; }
+  }
+  if (best < 0) return 0;
+  uint32_t last = (uint32_t)best;
+  for (uint32_t k = 1; k < ROLL_PER_SECT; k++) {
+    esp_partition_read(rollPart, (1 + bestSect) * 4096 + k * sizeof(RollRec), &r, sizeof r);
+    if (r.seq == 0xFFFFFFFFu || r.run != rollHdr.run) break;
+    last = r.seq;
+  }
+  return last;
+}
+
+static void rollInit() {
+  if (!ROLL_ENABLE) return;
+  rollPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, (esp_partition_subtype_t)0x40, "rolllog");
+  if (!rollPart || rollPart->size < 3 * 4096) { rollPart = nullptr; return; }
+  rollSectors = rollPart->size / 4096 - 1;
+  rollCap = rollSectors * ROLL_PER_SECT;
+  esp_partition_read(rollPart, 0, &rollHdr, sizeof rollHdr);
+  const bool valid = rollHdr.magic == ROLL_MAGIC && rollHdr.recSize == sizeof(RollRec);
+  if (valid && (rollHdr.state == RS_FROZEN || rollHdr.state == RS_POST)) {
+    if (rollHdr.state == RS_POST) {             // coupure avant la fin : on fige ce qui a été écrit
+      rollHdr.lastSeq = rollScanLast();
+      rollHdr.state = RS_FROZEN;
+      rollWriteHdr();
+    }
+    rollSeq = rollHdr.lastSeq + 1;
+    rollState = RS_FROZEN;
+  } else {
+    if (!valid) rollHdr.magic = 0;
+    rollStart();
+  }
+}
+
+static int16_t toMv16(float v) {
+  float m = v * 1000.0f;
+  if (m > 32767.0f) m = 32767.0f;
+  if (m < -32768.0f) m = -32768.0f;
+  return (int16_t)lrintf(m);
+}
+
+// Reçoit chaque ligne de 10 ms ; regroupe LOG_HZ/ROLL_HZ lignes (min/max fusionnés)
+static void rollFeed(const Row &r) {
+  static Row acc;
+  static int accN = 0;
+  if (!rollPart || (rollState != RS_RUN && rollState != RS_POST)) { accN = 0; return; }
+  const bool rValid = !(r.mn[0] == 0xFFFF && r.mx[0] == 0xFFFF);
+  if (accN == 0) acc = r;
+  else {
+    const bool aValid = !(acc.mn[0] == 0xFFFF && acc.mx[0] == 0xFFFF);
+    if (rValid && !aValid) { memcpy(acc.mn, r.mn, sizeof acc.mn); memcpy(acc.mx, r.mx, sizeof acc.mx); }
+    else if (rValid) {
+      for (int i = 0; i < FAST_N; i++) {
+        if (r.mn[i] < acc.mn[i]) acc.mn[i] = r.mn[i];
+        if (r.mx[i] > acc.mx[i]) acc.mx[i] = r.mx[i];
+      }
+    }
+    acc.flags |= r.flags;
+    acc.t_ms = r.t_ms;
+    memcpy(acc.ads, r.ads, sizeof acc.ads);
+  }
+  if (++accN < LOG_HZ / ROLL_HZ) return;
+  accN = 0;
+
+  RollRec &w = rollBuf[rollBufN++];
+  w.seq = rollSeq++;
+  w.t_ms = acc.t_ms;
+  w.run = rollHdr.run;
+  w.flags = (uint16_t)((acc.flags & 0x7FFF) | ((acc.flags & FLAG_FLASH) ? FLAG_FLASH : 0));
+  for (int c = 0; c < ADS_N; c++) w.ads[c] = toMv16(acc.ads[c]);
+  memcpy(w.mn, acc.mn, sizeof w.mn);
+  memcpy(w.mx, acc.mx, sizeof w.mx);
+  memset(w.pad, 0, sizeof w.pad);
+  if (rollBufN == ROLL_PER_SECT) {
+    xSemaphoreTake(flashMtx, portMAX_DELAY);
+    rollFlushSector();
+    xSemaphoreGive(flashMtx);
+  }
+}
+
+// Machine d'état : déclenchement, fin de la période « après », réarmement
+static void rollOnEvent(const Event &e) {
+  if (rollState != RS_RUN || e.phase == PH_END || !(ROLL_TRIG_MASK & (1u << e.type))) return;
+  rollHdr.state = RS_POST;
+  rollHdr.trigType = e.type; rollHdr.trigCh = e.ch; rollHdr.trigValue = e.value;
+  rollHdr.trigSeq = rollSeq; rollHdr.trigMs = e.t_ms;
+  rollPostEnd = millis() + ROLL_POST_S * 1000UL;
+  xSemaphoreTake(flashMtx, portMAX_DELAY);
+  rollWriteHdr();
+  xSemaphoreGive(flashMtx);
+  rollState = RS_POST;
+}
+
+static void rollPoll() {
+  if (!rollPart) return;
+  if (rollState == RS_POST && (int32_t)(millis() - rollPostEnd) >= 0) {
+    xSemaphoreTake(flashMtx, portMAX_DELAY);
+    rollFlushSector();
+    rollHdr.state = RS_FROZEN;
+    rollHdr.lastSeq = rollSeq ? rollSeq - 1 : 0;
+    rollWriteHdr();
+    xSemaphoreGive(flashMtx);
+    rollState = RS_FROZEN;
+  }
+  if (rollRearmReq) {
+    rollRearmReq = false;
+    if (rollState == RS_FROZEN) rollStart();
+  }
+}
+
+static uint32_t rollSecondsStored() {
+  if (!rollPart) return 0;
+  uint32_t n = (rollState == RS_FROZEN) ? rollHdr.lastSeq + 1 : rollSeq;
+  if (n > rollCap) n = rollCap;
+  return n / ROLL_HZ;
+}
+
 static void writerTask(void *) {
   static char buf[8192];
   size_t len = 0;
@@ -472,13 +668,17 @@ static void writerTask(void *) {
     Row r;
     if (xQueueReceive(rowQ, &r, pdMS_TO_TICKS(50)) == pdTRUE) {
       do {
-        len += formatRow(buf + len, sizeof buf - len, r);
-        if (len > sizeof buf - 512) flushBuf();
+        rollFeed(r);
+        if (logging && sdOk) {
+          len += formatRow(buf + len, sizeof buf - len, r);
+          if (len > sizeof buf - 512) flushBuf();
+        }
       } while (xQueueReceive(rowQ, &r, 0) == pdTRUE);
     }
 
     Event e;
-    while (xQueueReceive(evQ, &e, 0) == pdTRUE) writeEvent(e);
+    while (xQueueReceive(evQ, &e, 0) == pdTRUE) { writeEvent(e); rollOnEvent(e); }
+    rollPoll();
 
     if (capState == 2) dumpCapture();
 
@@ -503,7 +703,6 @@ static void writerTask(void *) {
       pauseReq = 0;
       if (logging) {
         logging = false;
-        xQueueReset(rowQ);
         flushBuf();
         SD_LOCK();
         if (fLog) fLog.close();
@@ -606,17 +805,24 @@ static void drawScreen() {
       snprintf(b, sizeof b, "%.1f Mo  perdus %lu/%lu  ADS %d%d%d", bytesWritten / 1048576.0f,
                (unsigned long)rowsDropped, (unsigned long)evLost, adsOk[0], adsOk[1], adsOk[2]);
       spr.drawString(b, 4, 76);
+      {
+        const uint8_t rs = rollState;
+        spr.setTextColor(rs == RS_FROZEN ? TFT_CYAN : (rs == RS_POST ? C_WARN : (rs == RS_RUN ? C_OK : C_DIM)));
+        if (rs == RS_FROZEN)
+          snprintf(b, sizeof b, "FLASH FIGEE: %s %s", EV_NAME[rollHdr.trigType], chName(rollHdr.trigCh));
+        else
+          snprintf(b, sizeof b, "Flash %s  %lu s / %lu s", RS_NAME[rs], (unsigned long)rollSecondsStored(),
+                   (unsigned long)(rollCap / ROLL_HZ));
+        spr.drawString(b, 4, 94);
+      }
       if (xSemaphoreTake(lastMtx, pdMS_TO_TICKS(5)) == pdTRUE) {
         if (lastEvN) {
           eventText(lastEv[0], b, sizeof b);
           spr.setTextColor(lastEv[0].type == EV_MARK ? TFT_CYAN : C_WARN);
-          spr.drawString(b, 4, 98);
+          spr.drawString(b, 4, 112);
         }
         xSemaphoreGive(lastMtx);
       }
-      spr.setTextColor(C_DIM);
-      if (WIFI_ENABLE) spr.drawString("WiFi " WIFI_SSID " 192.168.4.1", 4, 117);
-      else             spr.drawString("Bouton droit = MARQUEUR panne", 4, 117);
       break;
     }
     case 1: {
@@ -727,10 +933,14 @@ static void handleLive() {
   static char b[2048];
   int n = snprintf(b, sizeof b,
     "{\"t\":%lu,\"armed\":%d,\"rec\":%d,\"sd\":%d,\"file\":\"%s\",\"ev\":%lu,\"caps\":%lu,\"mb\":%.2f,"
-    "\"drop\":%lu,\"evlost\":%lu,\"adsHz\":%lu,\"fastHz\":%lu,\"a\":{",
+    "\"drop\":%lu,\"evlost\":%lu,\"adsHz\":%lu,\"fastHz\":%lu,"
+    "\"roll\":{\"st\":\"%s\",\"sec\":%lu,\"cap\":%lu,\"run\":%u,\"trig\":\"%s %s %.3f\",\"trigT\":%lu,\"boot\":%lu},\"a\":{",
     (unsigned long)millis(), ecuArmed ? 1 : 0, logging ? 1 : 0, sdOk ? 1 : 0, logName,
     (unsigned long)evTotal, (unsigned long)capsWritten, bytesWritten / 1048576.0f,
-    (unsigned long)rowsDropped, (unsigned long)evLost, (unsigned long)adsRate, (unsigned long)fastRate);
+    (unsigned long)rowsDropped, (unsigned long)evLost, (unsigned long)adsRate, (unsigned long)fastRate,
+    RS_NAME[rollState], (unsigned long)rollSecondsStored(), (unsigned long)(rollCap / ROLL_HZ), rollHdr.run,
+    rollState >= RS_POST ? EV_NAME[rollHdr.trigType] : "-", rollState >= RS_POST ? chName(rollHdr.trigCh) : "",
+    rollState >= RS_POST ? rollHdr.trigValue : 0.0f, (unsigned long)rollHdr.trigMs, (unsigned long)rollHdr.boot);
   for (int c = 0; c < ADS_N; c++)
     n += snprintf(b + n, sizeof b - n, "%s\"%s\":%.4f", c ? "," : "", ADS_DEF[c].name, (float)adsPhys[c]);
   n += snprintf(b + n, sizeof b - n, "},\"f\":{");
@@ -827,6 +1037,68 @@ static void handleDownload() {
   SD_UNLOCK();
 }
 
+
+// Export CSV de l'anneau flash, dans l'ordre chronologique (même colonnes que le journal SD)
+static void handleRollCsv() {
+  if (!rollPart) { server.send(404, "text/plain", "pas de partition rolllog"); return; }
+  uint32_t last;
+  xSemaphoreTake(flashMtx, portMAX_DELAY);
+  if (rollState == RS_FROZEN) last = rollHdr.lastSeq;
+  else last = (rollSeq > rollBufN) ? rollSeq - rollBufN - 1 : 0;   // seulement ce qui est en flash
+  const RollHdr h = rollHdr;
+  xSemaphoreGive(flashMtx);
+  const uint32_t first = (last + 1 > rollCap) ? last + 1 - rollCap : 0;
+
+  char fname[48];
+  snprintf(fname, sizeof fname, "attachment; filename=\"roll_run%u.csv\"", h.run);
+  server.sendHeader("Content-Disposition", fname);
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+
+  static char out[4096];
+  int n = snprintf(out, sizeof out,
+    "# Blackbox PSA - memoire flash en boucle - cycle %u - demarrage %lu - etat %s - %d lignes/s\n"
+    "# declenchement: %s voie %s valeur %.4f a t_ms=%lu (ligne %lu)\n"
+    "# valeurs ADS arrondies au mV ; flags bit 15 = ecriture flash en cours (chaine rapide suspendue)\n"
+    "t_ms",
+    h.run, (unsigned long)h.boot, RS_NAME[rollState], ROLL_HZ,
+    h.state >= RS_POST ? EV_NAME[h.trigType] : "-", h.state >= RS_POST ? chName(h.trigCh) : "-",
+    h.trigValue, (unsigned long)h.trigMs, (unsigned long)h.trigSeq);
+  for (int c = 0; c < ADS_N; c++) n += snprintf(out + n, sizeof out - n, ",%s", ADS_DEF[c].name);
+  for (int i = 0; i < FAST_N; i++) n += snprintf(out + n, sizeof out - n, ",%s_min,%s_max", FAST_NAME[i], FAST_NAME[i]);
+  n += snprintf(out + n, sizeof out - n, ",flags\n");
+  server.sendContent(out, n);
+  n = 0;
+
+  static RollRec sect[ROLL_PER_SECT];
+  uint32_t loaded = 0xFFFFFFFFu;
+  for (uint32_t seq = first; seq <= last && rollCap; seq++) {
+    const uint32_t idx = seq % rollCap, s = idx / ROLL_PER_SECT;
+    if (s != loaded) {
+      xSemaphoreTake(flashMtx, portMAX_DELAY);
+      esp_partition_read(rollPart, (1 + s) * 4096, sect, sizeof sect);
+      xSemaphoreGive(flashMtx);
+      loaded = s;
+    }
+    const RollRec &r = sect[idx % ROLL_PER_SECT];
+    if (r.seq != seq || r.run != h.run) continue;              // écrasé ou vide
+    n += snprintf(out + n, sizeof out - n, "%lu", (unsigned long)r.t_ms);
+    for (int c = 0; c < ADS_N; c++) n += snprintf(out + n, sizeof out - n, ",%.3f", r.ads[c] * 1e-3f);
+    for (int i = 0; i < FAST_N; i++) {
+      if (r.mn[i] == 0xFFFF && r.mx[i] == 0xFFFF) n += snprintf(out + n, sizeof out - n, ",,");
+      else n += snprintf(out + n, sizeof out - n, ",%.3f,%.3f", r.mn[i] * 1e-3f, r.mx[i] * 1e-3f);
+    }
+    n += snprintf(out + n, sizeof out - n, ",%u\n", r.flags);
+    if (n > (int)sizeof out - 300) {
+      if (!server.client().connected()) return;
+      server.sendContent(out, n);
+      n = 0;
+    }
+  }
+  if (n) server.sendContent(out, n);
+  server.sendContent("");                                      // fin du transfert « chunked »
+}
+
 static void webTask(void *) {
   for (;;) { server.handleClient(); vTaskDelay(2); }
 }
@@ -841,6 +1113,8 @@ static void startWeb() {
   server.on("/dl", HTTP_GET, handleDownload);
   server.on("/api/mark", HTTP_POST, []() { postEvent(EV_MARK, PH_POINT, 255, 0, 0, millis()); server.send(200, "text/plain", "ok"); });
   server.on("/api/pause", HTTP_POST, []() { pauseReq = 1; server.send(200, "text/plain", "ok"); });
+  server.on("/roll.csv", HTTP_GET, handleRollCsv);
+  server.on("/api/roll/rearm", HTTP_POST, []() { rollRearmReq = true; server.send(200, "text/plain", "ok"); });
   server.begin();
   xTaskCreatePinnedToCore(webTask, "web", 8192, nullptr, 1, nullptr, 1);
 }
@@ -899,6 +1173,8 @@ void setup() {
   rowQ    = xQueueCreate(200, sizeof(Row));    // 2 s de tampon si la carte est lente
   lastMtx = xSemaphoreCreateMutex();
   sdMtx   = xSemaphoreCreateMutex();
+  flashMtx = xSemaphoreCreateMutex();
+  rollInit();
 
   disableCore0WDT();                           // la voie rapide occupe le cœur 0 en continu
   xTaskCreatePinnedToCore(fastTask,   "rapide",  4096, nullptr, 1, nullptr, 0);
@@ -916,8 +1192,12 @@ void loop() {
   static uint32_t tDraw = 0, markDown = 0;
   static bool lastNext = false, lastMark = false, pauseDone = false;
 
+  static uint32_t nextDown = 0;
+  static bool rearmDone = false;
   const bool next = digitalRead(BTN_NEXT) == LOW;
-  if (next && !lastNext) screen = (screen + 1) % NSCREENS;
+  if (next && !lastNext) { nextDown = millis(); rearmDone = false; }
+  if (next && !rearmDone && millis() - nextDown > 2000) { rollRearmReq = true; rearmDone = true; }
+  if (!next && lastNext && !rearmDone && millis() - nextDown > 30) screen = (screen + 1) % NSCREENS;
   lastNext = next;
 
   const bool mark = digitalRead(BTN_MARK) == LOW;

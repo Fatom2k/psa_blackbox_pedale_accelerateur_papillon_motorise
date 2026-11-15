@@ -68,7 +68,18 @@ static const AdsDef ADS_DEF[ADS_N] = {
 #define WIFI_PASS     "psa12345"    // 8 caractères minimum
 
 // ---------------------------------------------------------------------------
-// Enregistrement
+// Enregistrement en boucle dans la flash de la carte (partition « rolllog », ~2,4 Mo)
+// Tourne en permanence ; au premier événement déclencheur, continue ROLL_POST_S
+// secondes puis se FIGE (conservé après coupure) jusqu'au réarmement.
+// ---------------------------------------------------------------------------
+#define ROLL_ENABLE     1
+#define ROLL_HZ         50      // lignes/s (64 octets) -> ~13 min d'historique
+#define ROLL_POST_S     10      // secondes enregistrées après le déclenchement
+// Déclencheurs (types d'événements, voir EvType dans main.cpp) :
+#define ROLL_TRIG_MASK  ((1u << EV_PEDAL) | (1u << EV_RANGE) | (1u << EV_MARK))
+
+// ---------------------------------------------------------------------------
+// Enregistrement sur carte SD
 // ---------------------------------------------------------------------------
 #define LOG_HZ          100     // lignes/s dans le journal continu
 #define ROTATE_MIN      30      // nouveau fichier toutes les N minutes

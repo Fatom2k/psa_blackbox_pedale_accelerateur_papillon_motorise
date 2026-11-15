@@ -1,0 +1,5 @@
+# Flash 4 Mo de la TTGO T-Display v1.1
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x5000
+app0,     app,  factory, 0x10000,  0x180000
+rolllog,  data, 0x40,    0x190000, 0x270000
